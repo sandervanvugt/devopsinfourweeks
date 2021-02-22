@@ -45,6 +45,7 @@
         - docker-ce
         - docker-ce-cli 
         - containerd.io
+        - python3-pip
 
     - name: Add user to docker group
       user:

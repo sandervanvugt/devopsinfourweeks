@@ -1,0 +1,28 @@
+- name: deploy a webserver
+  hosts: kube
+  tasks:
+  - name: deploy a webserver
+    k8s:
+      api_version: apps/v1
+      namespace: default
+      definition:
+        kind: Deployment
+        metadata:
+          labels:
+            app: nginx
+          name: nginx-deploy
+        spec:
+          selector:
+            matchLabels:
+              app: nginx
+          replicas: 1
+          template:
+            metadata:
+              labels:
+                app: nginx
+          spec:
+            containers:
+            - name: mywebserver
+              image: nginx
+              ports:
+              - containerPort: 80
