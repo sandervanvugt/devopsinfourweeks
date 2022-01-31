@@ -1,0 +1,195 @@
+---
+- name: install role if necessary
+  hosts: localhost
+  gather_facts: no
+  remote_user: ansible
+  become: no
+  tasks:
+  - name: check if containerd role is present
+    command: ansible-galaxy role list
+    register: haverole
+  - debug:
+      var: haverole
+  - name: install containerd role if required
+    command: ansible-galaxy install geerlingguy.containerd
+    when: not "containerd" in haverole.stdout
+  tags: installrole
+
+- name: setup a kube cluster on Ubuntu
+  hosts: "{{ kubehost }}"
+  tasks:
+  - debug:
+      msg: running these tasks on {{ ansible_hostname }}
+  - name: check if we need to install containerd
+    shell: systemctl is-active containerd
+    ignore_errors: true
+    register: isactive
+  - include_role:
+      name: geerlingguy.containerd
+    when: isactive.rc != 0
+  - name: disable swap
+    command: swapoff -a
+  - name: remove swap from fstab
+    lineinfile:
+      dest: /etc/fstab
+      regexp: swap
+      state: absent
+  - name: write kernel modules load file
+    blockinfile:
+      create: True
+      path: /etc/modules-load.d/containerd.conf
+      block: |
+        overlay
+        br_netfilter
+  - name: load kernel modules
+    modprobe: 
+      name: "{{ item }}"
+      state: present
+    loop:
+    - overlay
+    - br_netfilter
+  - name: set /proc parameters
+    blockinfile:
+      create: True
+      path: /etc/sysctl.d/99-kubernetes-cri.conf
+      block: |
+        net.bridge.bridge-nf-call-iptables = 1
+        net.ipv4.ip_forward = 1
+        net.bridge.bridge-nf-call-ip6tables = 1
+  - name: re-read proc parameters
+    command: sysctl --system
+  - name: add google GPG key 
+    apt_key:
+      url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+      state: present
+  - name: add kube repo
+    apt_repository:
+      repo: deb http://apt.kubernetes.io/ kubernetes-xenial main
+      state: present
+      filename: kubernetes
+      mode: 0600
+  - name: install kubernetes packages
+    package:
+      name:
+      - kubeadm
+      - kubectl
+      - kubelet
+      state: present
+  - name: enable kubelet service
+    service:
+      name: kubelet
+      enabled: yes
+    notify: reboot_all_nodes
+  handlers:
+  - name: reboot_all_nodes
+    reboot:
+      post_reboot_delay: 10
+      reboot_timeout: 40
+      connect_timeout: 60
+      test_command: uptime
+  tags: initial_setup
+
+- name: set up localhost as a Kubernetes client
+  hosts: localhost
+  gather_facts: false
+  become: True
+  tasks:
+  - name: setting up ansible control host dependencies
+    pip:
+      name: "{{ item }}"
+    loop:
+    - kubernetes
+    - openshift
+  - name: fetch kubectl
+    shell: curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+  - name: install kubectl
+    command: install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+  tags: setup_local
+
+- name: install the cluster
+  ignore_errors: true
+  gather_facts: false
+  hosts: "{{ kubehost }}"
+  tasks:
+  - name: check if we already have a cluster
+    shell: ps aux | grep kube-api | grep -v grep
+    register: isrunning
+  - name: removeme after debugging
+    debug:
+      var: isrunning
+  - command: kubeadm init --pod-network-cidr=10.10.0.0/16
+    when: isrunning.rc != 0
+  tags: install_cluster
+
+- name: configure the client
+  hosts: localhost
+  gather_facts: false
+  become: True
+  tasks:
+  - debug:
+      msg: |
+        We need to fetch the client config to the ansible control host. Using all these plays to switch
+        between hosts is not pretty, should look for a better option.
+  - name: configuring kube client for user ansible
+    file: 
+      name: /home/ansible/.kube
+      state: directory
+      owner: ansible
+      group: ansible
+
+- name: fetch config file from remote host to ansible control host
+  hosts: "{{ kubehost }}"
+  gather_facts: false
+  become: True
+  tasks:  
+  - name: copying client access file from the managed host
+    fetch: 
+      src: /etc/kubernetes/admin.conf 
+      dest: /home/ansible/.kube/config
+      flat: True
+
+- name: changing permission mode
+  hosts: localhost
+  gather_facts: false
+  become: True
+  tasks:
+  - name: changing permissions mode
+    file:
+      name: /home/ansible/.kube/config
+      owner: ansible
+      group: ansible
+  tags: setup_client
+
+- name: setting up networking and removing taint from kube control
+  become: False
+  hosts: localhost
+  gather_facts: false
+  ignore_errors: true
+  tasks:
+  - name: checking if we need to install networking
+    command: kubectl get ns tigera-operator
+    register: tigera
+  - name: installing Tigera operator
+    command: kubectl create -f https://docs.projectcalico.org/manifests/tigera-operator.yaml
+    when: tigera.rc != 0
+  - name: fetch YAML file so that we can change networking
+    get_url:
+      url: https://docs.projectcalico.org/manifests/custom-resources.yaml
+      dest: /home/ansible/custom-resources.yaml
+  - name: change networking from 192.168 to 10.10
+    replace:
+      path: /home/ansible/custom-resources.yaml
+      regexp: '192\.168'
+      replace: '10.10'
+  - name: check if we need to create calico resources
+    command: kubectl get ns calico-system
+    register: calico
+  - name: create custom resources
+    command: kubectl create -f /home/ansible/custom-resources.yaml
+    when: calico.rc != 0
+  - name: remove taint from control node
+    command: kubectl taint nodes --all node-role.kubernetes.io/master-
+  - name: completed
+    debug:
+      msg: the Kubernetes AiO cluster setup is now completed! Run kubectl get all to verify
+  tags: finishing
